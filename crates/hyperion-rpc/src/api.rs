@@ -1246,6 +1246,7 @@ pub trait AgentApi: Send + Sync + 'static {
         prior_node_id: Option<String>,
         prior_secret: Option<String>,
         resp_pubkey: Option<String>,
+        endpoint: hyperion_types::NodeEndpointReport,
     ) -> Result<(String, String, Option<String>), RpcError>;
 
     /// Master-side heartbeat: verifies (node_id, secret) and bumps
@@ -1268,6 +1269,7 @@ pub trait AgentApi: Send + Sync + 'static {
         agent_version: String,
         tls_spki_pin: Option<String>,
         resp_pubkey: Option<String>,
+        endpoint: hyperion_types::NodeEndpointReport,
     ) -> Result<Option<String>, RpcError>;
 
     /// List enrolled nodes (master-side `nodes` table).
