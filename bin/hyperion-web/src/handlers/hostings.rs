@@ -93,8 +93,8 @@ struct NewTpl<'a> {
     /// Echoes the [cluster] master_accepts_hostings setting from
     /// agent.toml. When false the template hides the master from
     /// the Target-node dropdown — operator turned the master into
-    /// a control-plane-only node via Settings → Cluster → Cluster
-    /// placement.
+    /// a control-plane-only node via Settings → Cluster →
+    /// Placement.
     master_accepts_hostings: bool,
     /// CSV of node ids flagged as test-only. JS uses this to know
     /// when to swap "Primary domain" for the "Test-site short name"
@@ -1438,7 +1438,7 @@ pub async fn post_create(
                         &form,
                         "Auto-placement found no online workers and master is \
                          in control-plane-only mode. Enrol a worker or enable \
-                         master hosting in Settings → Cluster → Cluster placement.",
+                         master hosting in Settings → Cluster → Placement.",
                     )
                     .await);
                 }
@@ -1461,7 +1461,7 @@ pub async fn post_create(
             &ctx,
             &csrf_token,
             &form,
-            "Master is in control-plane-only mode (Settings → Cluster → Cluster placement). Pick a worker node from the dropdown.",
+            "Master is in control-plane-only mode (Settings → Cluster → Placement). Pick a worker node from the dropdown.",
         ).await);
     }
     // Library plugins/themes picked on the form. Checked before anything is
@@ -3624,7 +3624,7 @@ pub(crate) async fn configured_backup_targets(
         let unusable = if r.kind != "s3" {
             format!("a \"{}\" target — backups are only pushed to S3", r.kind)
         } else if !r.enabled {
-            "disabled in Settings → Backup targets".to_string()
+            "disabled in Settings → Backups → Off-site targets".to_string()
         } else {
             match r.secret_key_id.as_deref() {
                 None => "missing its secret key".to_string(),
@@ -7542,7 +7542,7 @@ fn render_server_facts(s: &hyperion_types::NodeStats) -> String {
 /// whose `domain == base` exists there. By construction that base
 /// hostname (a node's auto-subdomain parent) only ever receives the
 /// `*.<base>` wildcard cert issued in Settings → HTTPS & previews →
-/// Preview wildcard certificates, so a cert at that exact domain on
+/// Preview certificates, so a cert at that exact domain on
 /// that node IS the wildcard. This is strictly more accurate than
 /// assuming "test node ⇒ has wildcard" and needs no new RPC, schema,
 /// or wire change.
@@ -16566,7 +16566,7 @@ pub async fn post_snapshot_now(
                             Some(
                                 "No snapshot was taken. Either restic is not installed on the \
                                  node that owns this site, snapshots are switched off there \
-                                 (Settings → Backups & trash → What this panel keeps), or the \
+                                 (Settings → Backups → What is kept), or the \
                                  site has no document tree. The agent log on that node says \
                                  which."
                                     .into(),
