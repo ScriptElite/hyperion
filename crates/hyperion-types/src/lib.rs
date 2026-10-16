@@ -16,6 +16,7 @@
 pub mod care_check;
 pub mod cert;
 pub mod clock;
+pub mod crs;
 pub mod db;
 pub mod dkim;
 pub mod dns;
@@ -64,8 +65,8 @@ pub use limits::{
 };
 pub use migration::{HostingImportResult, HostingMigrationBundle, HostingMigrationManifest};
 pub use package::{
-    BackupCadence, FeatureToggle, HostingPackage, LiveFeatureState, PackageFeatures, PackageInput,
-    PackagePriorState, PackageState, ServicePackage,
+    BackupCadence, CrsPin, FeatureToggle, HostingPackage, LiveFeatureState, PackageFeatures,
+    PackageInput, PackagePriorState, PackageState, ServicePackage, FIREWALL_CHOICES,
 };
 pub use perf::{
     CarePerformance, CwvMetrics, CwvResult, PerformanceConfigView, PerformanceView, Vital,
@@ -90,7 +91,8 @@ pub use stats::{
     SetupComponentProgress, SetupStackStatus, SiteEmailLogEntry, SlackConfigView, SmtpAutodetect,
     SnapshotDiff, SnapshotOverview, SnapshotRestoreOutcome, SnapshotRetention, SnapshotSummary,
     TrashEntry, UpdateStatus, Web2faEnrollment, WebHostingAccess, WebLoginResult, WebUserSummary,
-    WebVerify2faResult, WpRegistrationView, NOTIFICATION_TOPICS, SNAPSHOT_TAG_WITH_DB,
+    WebVerify2faResult, WpRegistrationView, DEFAULT_PRE_UPDATE_KEEP_DAYS, NOTIFICATION_TOPICS,
+    SNAPSHOT_TAG_WITH_DB,
 };
 pub use stats::{CARE_REPORT_DEFAULT_BODY_TEMPLATE, EXPIRY_WARNING_DEFAULT_BODY_TEMPLATE};
 pub use wp::{

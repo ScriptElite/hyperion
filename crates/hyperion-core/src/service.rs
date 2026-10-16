@@ -14,7 +14,7 @@ use hyperion_state::{
     certificates, databases, hostings, metrics, packages, profiles, system_users, wordpress,
 };
 use hyperion_types::package::{
-    CareBackups, CareIntegrity, CareReport, CareUptime, CareUsage, ReportCadence,
+    CareBackups, CareIntegrity, CareReport, CareUptime, CareUsage, CrsPin, ReportCadence,
 };
 use hyperion_types::report_sections::{ReportOmit, ReportSection};
 use hyperion_types::{
@@ -400,6 +400,25 @@ pub trait AdapterPort: Send + Sync {
     /// Restart hyperion-agent a few seconds from now, after the current
     /// reply has gone out.
     fn schedule_self_restart(&self) {}
+
+    /// What this node's ModSecurity engine looks like (files only; the
+    /// service fills in the site count). Default: no engine.
+    async fn modsec_status(&self) -> hyperion_types::crs::ModsecStatus {
+        hyperion_types::crs::ModsecStatus::default()
+    }
+
+    /// Install the ModSecurity connector and the Core Rule Set.
+    async fn modsec_install(&self) -> Result<(), AdapterError> {
+        Err(AdapterError::Other(
+            "installing ModSecurity is not supported here".into(),
+        ))
+    }
+
+    /// Load (`need`) or unload the rule set at http level, `nginx -t` +
+    /// reload included. Returns whether anything changed.
+    async fn modsec_sync_http(&self, _need: bool) -> Result<bool, AdapterError> {
+        Ok(false)
+    }
 }
 
 /// Live state of the panel-vhost ACME issuance.
@@ -2100,6 +2119,17 @@ impl<A: AdapterPort + 'static> HostingService<A> {
                 .nginx_apply_suspended(&detail.domain, detail.aliases.clone(), reason)
                 .await
                 .map_err(|e| RpcError::Internal_with(format!("suspended vhost: {e}")));
+        }
+        if detail.vhost_options.crs_settings().mode != hyperion_types::crs::CrsMode::Off {
+            // A CRS site coming back (resumed, restored from the trash) after
+            // the rule set was unloaded while it was away: load it first, or
+            // the site would run the engine with no rules in it.
+            let st = self.adapters.modsec_status().await;
+            if st.available() && !st.loaded {
+                if let Err(e) = self.adapters.modsec_sync_http(true).await {
+                    tracing::warn!(domain = %detail.domain, error = %e, "crs: could not load the rule set");
+                }
+            }
         }
         self.adapters
             .nginx_write_vhost(detail)
@@ -4286,6 +4316,11 @@ impl<A: AdapterPort + 'static> HostingService<A> {
         hostings::delete(&self.pool, &detail.id)
             .await
             .map_err(|e| RpcError::Internal_with(format!("delete row: {e}")))?;
+        // The last site using the Core Rule Set gone: unload it (it costs
+        // memory in every nginx process). Best-effort — boot re-checks.
+        if detail.vhost_options.crs_settings().mode != hyperion_types::crs::CrsMode::Off {
+            let _ = self.crs_sync().await;
+        }
         self.append_audit(
             "hosting.purge",
             Some(detail.id.as_str()),
@@ -5282,6 +5317,71 @@ impl<A: AdapterPort + 'static> HostingService<A> {
             &hyperion_types::waf::parse_overrides(&options.waf_overrides),
         );
 
+        // ─── OWASP Core Rule Set ───────────────────────────────────
+        let stored_crs = detail.vhost_options.crs_settings();
+        if options.crs_mode.trim().is_empty() {
+            // A caller that predates the CRS tier (an older master, an API
+            // client sending only the fields it knows): keep every stored
+            // CRS setting rather than reading the empty mode as "off".
+            options.crs_mode = detail.vhost_options.crs_mode.clone();
+            options.crs_paranoia = detail.vhost_options.crs_paranoia;
+            options.crs_threshold = detail.vhost_options.crs_threshold;
+            options.crs_wordpress = detail.vhost_options.crs_wordpress;
+            options.crs_exclusions = detail.vhost_options.crs_exclusions.clone();
+        } else {
+            use hyperion_types::crs;
+            let Some(mode) = crs::CrsMode::parse(&options.crs_mode) else {
+                return Err(RpcError::Validation {
+                    message: "crs_mode must be off, detect or block".into(),
+                });
+            };
+            options.crs_mode = mode.as_str().to_string();
+            if options.crs_paranoia == 0 {
+                options.crs_paranoia = crs::DEFAULT_PARANOIA;
+            }
+            if !crs::PARANOIA_CHOICES.contains(&options.crs_paranoia) {
+                return Err(RpcError::Validation {
+                    message: "crs_paranoia must be 1 or 2".into(),
+                });
+            }
+            if options.crs_threshold == 0 {
+                options.crs_threshold = crs::DEFAULT_THRESHOLD;
+            }
+            if !(2..=100).contains(&options.crs_threshold) {
+                return Err(RpcError::Validation {
+                    message: "crs_threshold must be 2..=100".into(),
+                });
+            }
+            // Strict here, lenient on read: what is STORED must be exactly
+            // what the vhost renders, so a bad entry is refused by name.
+            let list: Vec<crs::CrsExclusion> = if options.crs_exclusions.trim().is_empty() {
+                Vec::new()
+            } else {
+                serde_json::from_str(&options.crs_exclusions).map_err(|e| RpcError::Validation {
+                    message: format!("crs_exclusions is not a valid list: {e}"),
+                })?
+            };
+            crs::validate_exclusions(&list).map_err(|message| RpcError::Validation { message })?;
+            options.crs_exclusions = crs::exclusions_to_string(&list);
+            // Turning it ON needs the engine on THIS node. A site that already
+            // had it on keeps saving even if the engine has gone since — the
+            // vhost then renders without it rather than refusing every save.
+            if mode != crs::CrsMode::Off && stored_crs.mode == crs::CrsMode::Off {
+                let st = self.adapters.modsec_status().await;
+                if !st.available() {
+                    return Err(RpcError::Validation {
+                        message:
+                            "The OWASP Core Rule Set needs ModSecurity on this node — install \
+                                  it from the Protection card first."
+                                .into(),
+                    });
+                }
+            }
+        }
+        // Whether the node's need for the http-level rule set may change.
+        let crs_toggled = (options.crs_settings().mode == hyperion_types::crs::CrsMode::Off)
+            != (stored_crs.mode == hyperion_types::crs::CrsMode::Off);
+
         // ─── htpasswd write (before persist, so a failed bcrypt is
         //     surfaced before we change DB state) ─────────────────────
         let pw_nonempty = basic_auth_password.as_deref().filter(|s| !s.is_empty());
@@ -5328,6 +5428,28 @@ impl<A: AdapterPort + 'static> HostingService<A> {
         .await
         .map_err(|e| RpcError::Internal_with(format!("persist vhost options: {e}")))?;
 
+        // ─── Rule set in or out at http level ──────────────────────
+        // Before the vhost: a site switching CRS on needs the rule set loaded
+        // first; one switching off may unload it now — its old vhost names
+        // only per-site rules, which load without the rule set.
+        if crs_toggled {
+            if let Err(e) = self.crs_sync().await {
+                let _ = hyperion_state::hostings::set_vhost_options(
+                    &self.pool,
+                    &detail.id,
+                    &detail.vhost_options,
+                    None,
+                    now_secs(),
+                )
+                .await;
+                return Err(RpcError::Validation {
+                    message: format!(
+                        "ModSecurity rule set could not be loaded: {e}. No changes applied."
+                    ),
+                });
+            }
+        }
+
         // ─── Re-render vhost (nginx -t inside write_vhost) ─────────
         let mut new_detail = detail.clone();
         new_detail.vhost_options = options.clone();
@@ -5343,6 +5465,9 @@ impl<A: AdapterPort + 'static> HostingService<A> {
                 now_secs(),
             )
             .await;
+            if crs_toggled {
+                let _ = self.crs_sync().await;
+            }
             // Roll back htpasswd too if we just wrote it.
             if pw_provided {
                 if detail.vhost_options.basic_auth_set {
@@ -6875,6 +7000,34 @@ impl<A: AdapterPort + 'static> HostingService<A> {
         }
     }
 
+    /// The full backup taken before an automatic update batch. Local only
+    /// (a rollback copy, never pushed off-site or dropped), marked
+    /// `pre-update` and HELD from the moment it exists: the sweep releases it
+    /// to `[backup_retention] pre_update_keep_days` only once every update in
+    /// the batch went in cleanly, so a failed batch — or an agent that died
+    /// half-way — keeps it until somebody deletes it by hand.
+    ///
+    /// Returns the run id; an error means no usable backup exists and the
+    /// caller must not update.
+    pub(crate) async fn pre_update_backup(&self, id: &HostingId) -> Result<i64, String> {
+        let run = self
+            .backup_run_for(
+                HostingSelector::Id(id.clone()),
+                Vec::new(),
+                OffsiteSource::NotWanted,
+                None,
+                hyperion_state::backups::PURPOSE_PRE_UPDATE,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if run.state != "ok" {
+            return Err(run
+                .error_message
+                .unwrap_or_else(|| format!("backup ended in state {}", run.state)));
+        }
+        Ok(run.id)
+    }
+
     /// Produce a tar.gz + DB dump backup. Single 'local' target for v1.
     ///
     /// The RPC entry point, i.e. every backup a HUMAN asked for: the panel
@@ -6903,6 +7056,23 @@ impl<A: AdapterPort + 'static> HostingService<A> {
         s3_targets: Vec<hyperion_types::S3BackupTarget>,
         offsite: OffsiteSource,
         progress_job_id: Option<String>,
+    ) -> Result<hyperion_types::BackupRunWire, RpcError> {
+        self.backup_run_for(sel, s3_targets, offsite, progress_job_id, "")
+            .await
+    }
+
+    /// [`Self::backup_run`] for a run with a `purpose` (migration 083). The
+    /// purpose is written — held — the moment the row exists, BEFORE the
+    /// prune at the end of the run: written afterwards, the new run would
+    /// count once as one of the site's newest backups and could push a real
+    /// one past the floor.
+    async fn backup_run_for(
+        &self,
+        sel: HostingSelector,
+        s3_targets: Vec<hyperion_types::S3BackupTarget>,
+        offsite: OffsiteSource,
+        progress_job_id: Option<String>,
+        purpose: &str,
     ) -> Result<hyperion_types::BackupRunWire, RpcError> {
         let detail = self.get(sel).await?;
         let backup_root = self.paths.backup_root.clone();
@@ -6943,6 +7113,11 @@ impl<A: AdapterPort + 'static> HostingService<A> {
             if let Err(e) = hyperion_state::backups::mark_no_offsite(&self.pool, run_id).await {
                 tracing::warn!(error = %e, "could not mark rollback snapshot no_offsite");
             }
+        }
+        if !purpose.is_empty() {
+            hyperion_state::backups::set_purpose(&self.pool, run_id, purpose, true)
+                .await
+                .map_err(|e| RpcError::Internal_with(format!("backup purpose: {e}")))?;
         }
         // Build target dir
         let ts = now_secs();
@@ -8058,7 +8233,17 @@ impl<A: AdapterPort + 'static> HostingService<A> {
                 .await
                 .unwrap_or(global.keep_latest_n),
         };
-        let cutoff = now_secs() - retention.max_age_days.max(1) * 24 * 3600;
+        let now = now_secs();
+        let cutoff = now - retention.max_age_days.max(1) * 24 * 3600;
+        // Pre-update backups live by their own rule, read live like the rest.
+        let pre_update_cutoff = now
+            - match self.agent_config_path.as_deref() {
+                Some(path) => read_backup_retention_section(Some(path)).pre_update_keep_days,
+                None => hyperion_types::DEFAULT_PRE_UPDATE_KEEP_DAYS,
+            }
+            .max(1)
+                * 24
+                * 3600;
         let keep = retention.keep_latest_n.max(1) as usize;
         let mut pruned = 0u64;
         let mut good_kept = 0usize;
@@ -8070,12 +8255,21 @@ impl<A: AdapterPort + 'static> HostingService<A> {
             if r.state == "running" {
                 continue;
             }
-            if r.state == "ok" && good_kept < keep {
-                good_kept += 1;
-                continue;
-            }
-            if r.started_at >= cutoff {
-                continue;
+            if r.is_pre_update() {
+                // Its own rule, and never one of the site's newest N: a
+                // nightly update batch must not push the real scheduled
+                // backups past the floor.
+                if !pre_update_due_for_prune(&r, pre_update_cutoff) {
+                    continue;
+                }
+            } else {
+                if r.state == "ok" && good_kept < keep {
+                    good_kept += 1;
+                    continue;
+                }
+                if r.started_at >= cutoff {
+                    continue;
+                }
             }
             // A restore (or a push) is reading it right now: pruning it would
             // pull the database dump out from under the restore. The next
@@ -14332,6 +14526,124 @@ impl<A: AdapterPort + 'static> HostingService<A> {
         }
     }
 
+    /// This node's ModSecurity engine, and how many of its sites use it.
+    pub async fn modsec_status(&self) -> Result<hyperion_types::crs::ModsecStatus, RpcError> {
+        let mut st = self.adapters.modsec_status().await;
+        st.active_sites = hyperion_state::hostings::count_crs_on(&self.pool)
+            .await
+            .unwrap_or(0)
+            .max(0) as u32;
+        Ok(st)
+    }
+
+    /// Load the Core Rule Set at http level while some active site on this
+    /// node uses it, unload it otherwise — it costs memory in every nginx
+    /// process. Idempotent; reloads nginx only when something changed.
+    pub async fn crs_sync(&self) -> Result<bool, RpcError> {
+        let st = self.adapters.modsec_status().await;
+        let users = hyperion_state::hostings::count_crs_on(&self.pool)
+            .await
+            .map_err(|e| RpcError::Internal_with(format!("count CRS sites: {e}")))?;
+        self.adapters
+            .modsec_sync_http(st.available() && users > 0)
+            .await
+            .map_err(|e| RpcError::Internal_with(format!("ModSecurity: {e}")))
+    }
+
+    /// Install ModSecurity + the Core Rule Set on this node. Slow (apt):
+    /// the web side runs it as a background job.
+    pub async fn modsec_install(&self) -> Result<hyperion_types::crs::ModsecStatus, RpcError> {
+        if let Some(rw_err) = check_usr_writable().await {
+            return Err(RpcError::Conflict { message: rw_err });
+        }
+        let res = self.adapters.modsec_install().await;
+        self.append_audit(
+            "modsec.install",
+            None,
+            "{}",
+            if res.is_ok() { "ok" } else { "error" },
+        )
+        .await;
+        res.map_err(|e| RpcError::Internal_with(e.to_string()))?;
+        self.crs_sync().await?;
+        self.modsec_status().await
+    }
+
+    /// Read the node's ModSecurity audit log from where the last pass
+    /// stopped and record each CRS decision against the site it belongs to.
+    ///
+    /// One log for the whole node (ModSecurity ignores per-site audit logs);
+    /// every entry carries the site's id in its transaction id, which the
+    /// site's own server block sets — a request cannot choose it. Entries
+    /// for ids this node does not host are dropped. CRS decisions never
+    /// earn a firewall ban: their tags are not ban-counted.
+    async fn crs_ingest(&self, audit: &std::path::Path, now: i64) {
+        if !tokio::fs::try_exists(audit).await.unwrap_or(false) {
+            return;
+        }
+        let pos = hyperion_state::node_kv::get(&self.pool, MODSEC_AUDIT_POS_KEY)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| hyperion_adapters::waflog::LogPos::decode(&v));
+        let path = audit.to_path_buf();
+        let read = tokio::task::spawn_blocking(move || {
+            let mut by_site: std::collections::HashMap<String, hyperion_types::waf::WafBatch> =
+                std::collections::HashMap::new();
+            let r = hyperion_adapters::waflog::read_new_lines(
+                &path,
+                pos,
+                hyperion_adapters::waflog::MAX_READ_BYTES,
+                &mut |line| {
+                    if let Some((site, hit)) = hyperion_adapters::modsec::parse_audit_line(line) {
+                        if by_site.len() < 10_000 || by_site.contains_key(&site) {
+                            by_site.entry(site).or_default().push(hit);
+                        }
+                    }
+                },
+            );
+            r.map(|(p, skipped)| (by_site, p, skipped))
+        })
+        .await;
+        let (by_site, new_pos, skipped) = match read {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "crs: could not read the ModSecurity audit log");
+                return;
+            }
+            Err(_) => return,
+        };
+        if skipped > 0 {
+            tracing::warn!(
+                skipped_bytes = skipped,
+                "crs: audit log backlog over the per-tick budget; oldest entries skipped"
+            );
+        }
+        let known: std::collections::HashSet<String> = match self.list().await {
+            Ok(v) => v.into_iter().map(|s| s.id.as_str().to_string()).collect(),
+            Err(_) => return,
+        };
+        for (site, batch) in &by_site {
+            if !known.contains(site) {
+                continue;
+            }
+            if let Err(e) = hyperion_state::waf::record(&self.pool, site, batch).await {
+                // Do not advance past entries that were not stored.
+                tracing::warn!(error = %e, "crs: could not record audit entries");
+                return;
+            }
+        }
+        if Some(new_pos) != pos {
+            let _ = hyperion_state::node_kv::set(
+                &self.pool,
+                MODSEC_AUDIT_POS_KEY,
+                &new_pos.encode(),
+                now,
+            )
+            .await;
+        }
+    }
+
     /// Addresses no automatic ban may hit, whatever a log says: this
     /// machine's own — a site calling itself on its public address (WP-cron,
     /// Site Health) arrives FROM it, and a tenant's PHP can make that
@@ -14695,6 +15007,11 @@ impl<A: AdapterPort + 'static> HostingService<A> {
                 now,
             )
             .await;
+        self.crs_ingest(
+            std::path::Path::new(hyperion_adapters::modsec::AUDIT_LOG),
+            now,
+        )
+        .await;
         if !self.fail2ban.enabled {
             return Ok(0);
         }
@@ -15578,15 +15895,40 @@ impl<A: AdapterPort + 'static> HostingService<A> {
                     .filter(|f| !crate::wp_updates::is_paused(&skips, &f.slug, now))
                     .map(|f| (f.kind.clone(), f.slug.clone()))
                     .collect();
-                // One snapshot before the batch, not one per plugin: the
-                // operator's question is "what did tonight's updates change",
-                // and five snapshots taken seconds apart answer a question
-                // nobody asked while costing five prunes.
-                if !targets.is_empty() {
-                    if let Ok(d) = self.get(HostingSelector::Id(s.id.clone())).await {
-                        let _ = self.snapshot_before_change(&d, "pre-update").await;
+                // The minor core release this batch would apply, decided up
+                // front so the backup below covers core as well.
+                let core_release = scan.core_updates.iter().find(|u| u.is_minor()).cloned();
+                // ONE full backup (files + database) before the batch — what a
+                // care plan promises ("backed up before every update"), and the
+                // same kind of copy every other backup is, restorable from the
+                // same screen. Not one per plugin: the question afterwards is
+                // "what did tonight's updates change".
+                //
+                // No backup, no updates: an update that breaks the site with
+                // nothing to go back to is exactly what the promise rules out.
+                // The site waits for the next sweep and the operator hears why.
+                let mut pre_update_run: Option<i64> = None;
+                let mut batch_failed = false;
+                let mut skip_batch = false;
+                if !targets.is_empty() || core_release.is_some() {
+                    match self.pre_update_backup(&s.id).await {
+                        Ok(id) => pre_update_run = Some(id),
+                        Err(e) => {
+                            skip_batch = true;
+                            tracing::warn!(domain = %s.domain, error = %e,
+                                "wp auto-update: pre-update backup failed — updates skipped");
+                            self.notify_admins_say(
+                                "warn",
+                                "ops.preupdate_backup_failed",
+                                &[("domain", &s.domain), ("error", &e)],
+                                &format!("/hostings/{}#backups", s.domain),
+                                &format!("wp.update.backup_failed:{}", s.domain),
+                            )
+                            .await;
+                        }
                     }
                 }
+                let targets = if skip_batch { Vec::new() } else { targets };
                 for (kind, slug) in targets {
                     let state = if kind == "theme" {
                         self.wp_theme_action(
@@ -15614,6 +15956,7 @@ impl<A: AdapterPort + 'static> HostingService<A> {
                             }
                         }
                         other => {
+                            batch_failed = true;
                             let err_msg = match &other {
                                 Ok(_) => format!("wp update {kind} {slug} reported failed"),
                                 Err(e) => e.to_string(),
@@ -15654,9 +15997,10 @@ impl<A: AdapterPort + 'static> HostingService<A> {
                 // major is where themes break and stays a decision a
                 // person makes while they are around to look at it.
                 //
-                // The snapshot above already covers this: it is taken
+                // The backup above already covers this: it is taken
                 // before the whole batch, so a core update that goes
                 // wrong is one restore away like everything else.
+                let core_release = if skip_batch { None } else { core_release };
                 if let Ok(detail) = self.get(HostingSelector::Id(s.id.clone())).await {
                     let user = detail.system_user.trim().to_string();
                     let root = detail.root_dir.trim().to_string();
@@ -15664,16 +16008,7 @@ impl<A: AdapterPort + 'static> HostingService<A> {
                         // The scan above asked `wp core check-update`; an
                         // error there left the list empty — "we do not know"
                         // must not become "update anyway".
-                        if let Some(rel) = scan.core_updates.iter().find(|u| u.is_minor()).cloned()
-                        {
-                            // A snapshot before core specifically, even
-                            // though the batch already took one: a site
-                            // whose plugins updated cleanly and whose CORE
-                            // then broke wants to go back to the working
-                            // plugins, not to last night.
-                            let _ = self
-                                .snapshot_before_change(&detail, "pre-core-update")
-                                .await;
+                        if let Some(rel) = core_release.clone() {
                             match hyperion_adapters::wpcli::core_update_minor(&user, &root).await {
                                 Ok(out) => {
                                     auto_updated += 1;
@@ -15697,6 +16032,7 @@ impl<A: AdapterPort + 'static> HostingService<A> {
                                     .await;
                                 }
                                 Err(e) => {
+                                    batch_failed = true;
                                     // Worth telling somebody: unlike a
                                     // commercial plugin needing a licence,
                                     // a core update that will not apply
@@ -15733,6 +16069,31 @@ impl<A: AdapterPort + 'static> HostingService<A> {
                         Ok(r) => rescan_error = Some(r.error),
                         Err(e) => rescan_error = Some(e.to_string()),
                     }
+                }
+                // Release the pre-update backup to its retention only when the
+                // whole batch went in cleanly. Anything else keeps it held —
+                // it is the last copy from before whatever went wrong.
+                if let Some(run_id) = pre_update_run {
+                    let clean = !batch_failed && rescan_error.is_none();
+                    if clean {
+                        if let Err(e) =
+                            hyperion_state::backups::set_held(&self.pool, run_id, false).await
+                        {
+                            tracing::warn!(error = %e, "pre-update backup: release failed");
+                        }
+                    }
+                    self.append_audit(
+                        "hosting.backup.pre_update",
+                        Some(s.id.as_str()),
+                        &serde_json::json!({
+                            "run_id": run_id,
+                            "updated": auto_updated,
+                            "held": !clean,
+                        })
+                        .to_string(),
+                        "ok",
+                    )
+                    .await;
                 }
             }
             scan.auto_updated = auto_updated;
@@ -19807,7 +20168,21 @@ impl<A: AdapterPort + 'static> HostingService<A> {
             wp_auto_update: toggle_of(prior.wp_auto_update),
             integrity_scan: toggle_of(prior.integrity_scan),
             monitoring: toggle_of(prior.monitoring),
-            hardening: toggle_of(prior.hardening),
+            // An exact prior level (rows from migration 084 on) is put back
+            // below, after the push; an older row restores through the
+            // on/off it recorded, as it always did.
+            hardening: if prior.waf_level.is_some() {
+                FeatureToggle::Leave
+            } else {
+                toggle_of(prior.hardening)
+            },
+            firewall_strict: false,
+            crs: prior
+                .crs
+                .as_deref()
+                .map(CrsPin::from_stored)
+                .unwrap_or_default(),
+            bruteforce: toggle_of(prior.bruteforce),
             backup_cadence: prior.backup_cadence.unwrap_or_default(),
             // The custom period + retention ride with the cadence above: a
             // non-`Leave` prior cadence re-opens the backup block in
@@ -19836,15 +20211,43 @@ impl<A: AdapterPort + 'static> HostingService<A> {
         if still_forced.monitoring.forces().is_some() {
             restore.monitoring = FeatureToggle::Leave;
         }
-        if still_forced.hardening.forces().is_some() {
+        let firewall_still_forced = still_forced.hardening.forces().is_some();
+        if firewall_still_forced {
             restore.hardening = FeatureToggle::Leave;
+        }
+        if !still_forced.crs.is_leave() {
+            restore.crs = CrsPin::Leave;
+        }
+        if still_forced.bruteforce.forces().is_some() {
+            restore.bruteforce = FeatureToggle::Leave;
         }
         if !still_forced.backup_cadence.is_leave() {
             restore.backup_cadence = BackupCadence::Leave;
         }
 
         let live = self.package_live_state(&detail).await;
-        let changed = self.package_push_features(&detail, &restore, &live).await;
+        let mut changed = self.package_push_features(&detail, &restore, &live).await;
+        // The exact WAF level from before the package: a Standard site that a
+        // Strict plan raised goes back to Standard, not "still on".
+        if !firewall_still_forced {
+            if let Some(level) = prior
+                .waf_level
+                .as_deref()
+                .and_then(hyperion_types::waf::WafLevel::parse)
+            {
+                if level != live.waf_level {
+                    let r = self.package_set_waf_level(&detail, level).await;
+                    push_change(
+                        &mut changed,
+                        &detail,
+                        "firewall",
+                        live.waf_level.as_str(),
+                        level.as_str(),
+                        r,
+                    );
+                }
+            }
+        }
         self.append_audit(
             "package.cancel",
             Some(detail.id.as_str()),
@@ -19901,7 +20304,22 @@ impl<A: AdapterPort + 'static> HostingService<A> {
         // other every tick (On beats Off; the more frequent cadence wins).
         let mut order: Vec<HostingId> = Vec::new();
         let mut wanted: HashMap<String, PackageFeatures> = HashMap::new();
+        // Which plans sell protection to each site, and since when — for the
+        // protection check below (its alert names the plan; a plan that only
+        // just started gets the scanner's first pass before anyone is told).
+        let mut sellers: HashMap<String, (Vec<String>, i64)> = HashMap::new();
         for row in rows {
+            if row.features.bruteforce == FeatureToggle::On
+                || matches!(row.features.crs, CrsPin::Detect | CrsPin::Block)
+            {
+                let e = sellers
+                    .entry(row.hosting_id.as_str().to_string())
+                    .or_insert_with(|| (Vec::new(), i64::MAX));
+                if !e.0.contains(&row.package_name) {
+                    e.0.push(row.package_name.clone());
+                }
+                e.1 = e.1.min(row.valid_from.unwrap_or(row.activated_at));
+            }
             // The bundle comes from the ACTIVATION's own snapshot, never from
             // the definition: definitions are master-only, so resolving one
             // here would make this tick a silent no-op on every worker node.
@@ -19920,6 +20338,8 @@ impl<A: AdapterPort + 'static> HostingService<A> {
         }
 
         let mut corrected = 0i64;
+        // Asked at most once per tick, and only if some site needs it.
+        let mut engine: Option<bool> = None;
         for hosting_id in order {
             let Some(want) = wanted.get(hosting_id.as_str()) else {
                 continue;
@@ -19939,6 +20359,10 @@ impl<A: AdapterPort + 'static> HostingService<A> {
             }
             let live = self.package_live_state(&detail).await;
             let changed = self.package_push_features(&detail, want, &live).await;
+            if let Some((names, since)) = sellers.get(hosting_id.as_str()) {
+                self.package_protection_check(&detail, want, names, *since, &mut engine)
+                    .await;
+            }
             if changed.is_empty() {
                 continue; // nothing drifted — the common case
             }
@@ -19963,6 +20387,90 @@ impl<A: AdapterPort + 'static> HostingService<A> {
             .await;
         }
         Ok(corrected)
+    }
+
+    /// Is the protection a plan sells actually running on this site? A
+    /// package can force the per-site switches, but two things it cannot
+    /// force live on the NODE: the brute-force scanner (`[fail2ban] enabled`,
+    /// and the scanner having really looked at the site lately) and the
+    /// ModSecurity engine the Core Rule Set needs. When either is missing the
+    /// operator is told — once per change of reason, not on every tick — and
+    /// told nothing more once it is fixed.
+    async fn package_protection_check(
+        &self,
+        detail: &HostingDetail,
+        want: &PackageFeatures,
+        plans: &[String],
+        since: i64,
+        engine: &mut Option<bool>,
+    ) {
+        let id = detail.id.as_str();
+        let now = now_secs();
+        let cat = self.operator_catalog();
+        let mut reasons: Vec<String> = Vec::new();
+        if want.bruteforce == FeatureToggle::On {
+            if !self.fail2ban.enabled {
+                reasons.push(cat.render("ops.protection_reason.fail2ban_off", &[]));
+            } else if !self.http_bruteforce_scan_enabled(id).await {
+                reasons.push(cat.render("ops.protection_reason.scan_off", &[]));
+            } else {
+                let last =
+                    hyperion_state::hosting_kv::get(&self.pool, id, FAIL2BAN_HTTP_SINCE_KV_KEY)
+                        .await
+                        .ok()
+                        .flatten()
+                        .as_deref()
+                        .and_then(parse_coverage_stamp)
+                        .map(|(_, last)| last);
+                if bruteforce_evidence_missing(last, since, now) {
+                    reasons.push(cat.render("ops.protection_reason.no_scan", &[]));
+                }
+            }
+        }
+        if matches!(want.crs, CrsPin::Detect | CrsPin::Block) {
+            let available = match *engine {
+                Some(a) => a,
+                None => {
+                    let a = self.adapters.modsec_status().await.available();
+                    *engine = Some(a);
+                    a
+                }
+            };
+            if !available {
+                reasons.push(cat.render("ops.protection_reason.no_modsec", &[]));
+            }
+        }
+        let reason = reasons.join(" ");
+        let warned = hyperion_state::hosting_kv::get(&self.pool, id, PACKAGE_PROTECTION_WARNED_KV)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if reason == warned {
+            return;
+        }
+        if !reason.is_empty() {
+            self.notify_admins_say(
+                "warn",
+                "ops.package_protection",
+                &[
+                    ("domain", &detail.domain),
+                    ("plan", &plans.join(", ")),
+                    ("reason", &reason),
+                ],
+                &format!("/hostings/{}#protection", detail.domain),
+                &format!("protection.package:{}", detail.domain),
+            )
+            .await;
+        }
+        let _ = hyperion_state::hosting_kv::set(
+            &self.pool,
+            id,
+            PACKAGE_PROTECTION_WARNED_KV,
+            &reason,
+            now,
+        )
+        .await;
     }
 
     /// What every active package on this hosting adds up to. `Leave` on a
@@ -20024,6 +20532,9 @@ impl<A: AdapterPort + 'static> HostingService<A> {
                 .unwrap_or(false),
             hardening: detail.vhost_options.effective_waf_level()
                 != hyperion_types::waf::WafLevel::Off,
+            waf_level: detail.vhost_options.effective_waf_level(),
+            crs: detail.vhost_options.crs_settings().mode,
+            bruteforce: self.http_bruteforce_scan_enabled(id).await,
             // A site state, never `Leave`: "no cadence configured" is `Off`.
             backup_cadence: match hyperion_state::hosting_kv::get(&self.pool, id, BACKUP_KV_CADENCE)
                 .await
@@ -20106,14 +20617,56 @@ impl<A: AdapterPort + 'static> HostingService<A> {
                 );
             }
         }
-        if let Some(on) = want.hardening.forces() {
-            if on != live.hardening {
-                let r = self.package_set_hardening(detail, on).await;
+        // The firewall: Off, at least Standard (a stricter level the operator
+        // chose stays), or held at Strict.
+        if let Some(target) = package_waf_target(want.firewall_level(), live.waf_level) {
+            if target != live.waf_level {
+                let r = self.package_set_waf_level(detail, target).await;
                 push_change(
                     &mut changed,
                     detail,
-                    "hardening",
-                    feature_kv_value(live.hardening),
+                    "firewall",
+                    live.waf_level.as_str(),
+                    target.as_str(),
+                    r,
+                );
+            }
+        }
+        // The Core Rule Set tier of the same firewall. Switching it ON needs
+        // the ModSecurity engine on this node (the vhost path refuses
+        // otherwise), so without one the push waits quietly — the protection
+        // check tells the operator — and lands on the first tick after the
+        // engine is installed.
+        if let Some(mode) = want.crs.forces() {
+            let needs_engine = mode != hyperion_types::crs::CrsMode::Off
+                && live.crs == hyperion_types::crs::CrsMode::Off;
+            let engine_ok = !needs_engine || self.adapters.modsec_status().await.available();
+            if mode != live.crs && engine_ok {
+                let r = self.package_set_crs(detail, mode).await;
+                push_change(
+                    &mut changed,
+                    detail,
+                    "core_rule_set",
+                    live.crs.as_str(),
+                    mode.as_str(),
+                    r,
+                );
+            }
+        }
+        if let Some(on) = want.bruteforce.forces() {
+            if on != live.bruteforce {
+                let r = self
+                    .hosting_kv_set(
+                        id.to_string(),
+                        FAIL2BAN_HTTP_KV_KEY.into(),
+                        feature_kv_value(on).into(),
+                    )
+                    .await;
+                push_change(
+                    &mut changed,
+                    detail,
+                    "bruteforce",
+                    feature_kv_value(live.bruteforce),
                     feature_kv_value(on),
                     r,
                 );
@@ -20218,26 +20771,44 @@ impl<A: AdapterPort + 'static> HostingService<A> {
         .await
     }
 
-    /// Flip the WAF through the vhost-options path, which re-renders the
-    /// vhost and runs `nginx -t` before the change counts. The wp-admin
-    /// allowlist is deliberately untouched: it is a list of the operator's
-    /// own IPs, and no package can invent one.
-    async fn package_set_hardening(
+    /// Put the WAF on exactly `level` through the vhost-options path (vhost
+    /// re-render + `nginx -t`). Off goes through `waf_turn_off`, so rules
+    /// pinned on go too — the same "no WAF" the old switch meant.
+    async fn package_set_waf_level(
         &self,
         detail: &HostingDetail,
-        enabled: bool,
+        level: hyperion_types::waf::WafLevel,
     ) -> Result<(), RpcError> {
-        let mut options = detail.vhost_options.clone();
-        // Enabling keeps a stricter level the operator already chose;
-        // the package's promise is "protected", and Strict is that too.
-        // Disabling is "no WAF" — rules pinned on go as well.
-        match (enabled, detail.vhost_options.effective_waf_level()) {
-            (false, _) => options.waf_turn_off(),
-            (true, hyperion_types::waf::WafLevel::Off) => {
-                options.set_waf_level(hyperion_types::waf::WafLevel::Standard)
-            }
-            (true, current) => options.set_waf_level(current),
+        // Re-read: one push may write the firewall AND the rule set, and
+        // starting the second from the caller's snapshot would undo the first.
+        let mut options = self
+            .get(HostingSelector::Id(detail.id.clone()))
+            .await?
+            .vhost_options;
+        if level == hyperion_types::waf::WafLevel::Off {
+            options.waf_turn_off();
+        } else {
+            options.set_waf_level(level);
         }
+        self.set_vhost_options(HostingSelector::Id(detail.id.clone()), options, None)
+            .await?;
+        Ok(())
+    }
+
+    /// Set the Core Rule Set mode, leaving paranoia, threshold, the WordPress
+    /// exclusions and the operator's own exclusions as they are — those are
+    /// tuning for one site, not something a plan can know.
+    async fn package_set_crs(
+        &self,
+        detail: &HostingDetail,
+        mode: hyperion_types::crs::CrsMode,
+    ) -> Result<(), RpcError> {
+        // Re-read, for the same reason as `package_set_waf_level`.
+        let mut options = self
+            .get(HostingSelector::Id(detail.id.clone()))
+            .await?
+            .vhost_options;
+        options.crs_mode = mode.as_str().to_string();
         self.set_vhost_options(HostingSelector::Id(detail.id.clone()), options, None)
             .await?;
         Ok(())
@@ -33181,6 +33752,21 @@ fn feature_kv_value(on: bool) -> &'static str {
     }
 }
 
+/// The WAF level a package's firewall intent drives the site to, given the
+/// level it is on now — `None` when the package leaves the firewall alone.
+/// "At least Standard" keeps a Strict the operator set by hand: the promise
+/// is "protected", and Strict is that too.
+fn package_waf_target(
+    want: Option<hyperion_types::waf::WafLevel>,
+    live: hyperion_types::waf::WafLevel,
+) -> Option<hyperion_types::waf::WafLevel> {
+    use hyperion_types::waf::WafLevel;
+    Some(match want? {
+        WafLevel::Standard if live == WafLevel::Strict => WafLevel::Strict,
+        other => other,
+    })
+}
+
 /// A captured prior value as a restore intent. `None` — the package never
 /// forced this feature — stays `Leave`, so cancelling leaves it alone.
 fn toggle_of(prior: Option<bool>) -> FeatureToggle {
@@ -36999,6 +37585,9 @@ const WAF_AUTOBAN_KV_KEY: &str = "waf_autoban_enabled";
 const WAF_LOG_POS_KV_KEY: &str = "waf_log_pos";
 /// Refusals listed in the activity panel.
 const WAF_RECENT_SHOWN: i64 = 50;
+/// Where the CRS ingest stopped in the node's ModSecurity audit log
+/// (`node_kv`), `"<inode>:<offset>"`.
+const MODSEC_AUDIT_POS_KEY: &str = "modsec_audit_pos";
 /// Addresses one node reports to the Protection page.
 const WAF_OVERVIEW_TOP_IPS: i64 = 25;
 /// Bans one node reports to the Protection page's history.
@@ -37226,6 +37815,26 @@ const SITE_MAIL_WRAPPER: &str = "/usr/local/lib/hyperion/site-mail-wrapper";
 /// `[fail2ban] enabled` was off. Generous on purpose: the cost of being
 /// too strict is a letter that under-claims, which is the safe direction.
 const FAIL2BAN_COVERAGE_GAP_SECS: i64 = 3600;
+
+/// The last "protection is not running" reason a care plan's protection check
+/// told the operator about for a site (`hosting_kv`). Empty = nothing
+/// outstanding. Lets the check alert once per change instead of every tick.
+const PACKAGE_PROTECTION_WARNED_KV: &str = "package_protection_warned";
+
+/// Whether a site sold brute-force protection lacks recent proof that the
+/// scanner looked at it. The scanner stamps every tick; twice the coverage
+/// gap without a stamp means it is not running for this site. A plan that
+/// started less than that ago gets the scanner's first passes first.
+fn bruteforce_evidence_missing(last_scan: Option<i64>, plan_start: i64, now: i64) -> bool {
+    let grace = 2 * FAIL2BAN_COVERAGE_GAP_SECS;
+    if now.saturating_sub(plan_start) < grace {
+        return false;
+    }
+    match last_scan {
+        Some(last) => now.saturating_sub(last) > grace,
+        None => true,
+    }
+}
 
 /// The window an "attacks blocked" figure may be counted over, given when
 /// protection demonstrably started (`since`) and the report period
@@ -38938,6 +39547,11 @@ pub(crate) fn read_backup_retention_section(
             .get("keep_latest_n")
             .and_then(|x| x.as_integer())
             .unwrap_or(d.keep_latest_n),
+        pre_update_keep_days: sec
+            .get("pre_update_keep_days")
+            .and_then(|x| x.as_integer())
+            .filter(|n| *n > 0)
+            .unwrap_or(d.pre_update_keep_days),
     }
 }
 
@@ -39175,6 +39789,15 @@ fn parse_agent_section_fields(
                 let n = parse_int(v)?;
                 if !(1..=1000).contains(&n) {
                     return Err(bad(format!("keep_latest_n must be 1..=1000, got {n}")));
+                }
+                crate::config_persist::FieldValue::Int(n)
+            }
+            ("backup_retention", "pre_update_keep_days") => {
+                let n = parse_int(v)?;
+                if !(1..=3650).contains(&n) {
+                    return Err(bad(format!(
+                        "pre_update_keep_days must be 1..=3650, got {n}"
+                    )));
                 }
                 crate::config_persist::FieldValue::Int(n)
             }
@@ -39488,6 +40111,23 @@ fn row_to_summary(u: hyperion_state::web_users::WebUserRow) -> hyperion_types::W
     }
 }
 
+/// Whether a PRE-UPDATE backup has outlived its own retention: its batch went
+/// in cleanly (not held) and it started before `cutoff`. Always false for an
+/// ordinary backup, which the archive rule decides about. A failed pre-update
+/// run is due like a clean one — there is nothing in it to roll back to.
+pub(crate) fn pre_update_due_for_prune(
+    r: &hyperion_state::backups::BackupRun,
+    cutoff: i64,
+) -> bool {
+    if !r.is_pre_update() {
+        return false;
+    }
+    if r.state == "failed" {
+        return r.started_at < cutoff;
+    }
+    !r.held && r.started_at < cutoff
+}
+
 fn run_to_wire(r: hyperion_state::backups::BackupRun) -> hyperion_types::BackupRunWire {
     hyperion_types::BackupRunWire {
         sha256_hex: r.sha256_hex,
@@ -39499,6 +40139,8 @@ fn run_to_wire(r: hyperion_state::backups::BackupRun) -> hyperion_types::BackupR
         local_kept: String::new(),
         local_note: String::new(),
         s3_ok_targets: r.s3_ok_targets,
+        purpose: r.purpose,
+        held: r.held,
         id: r.id,
         hosting_id: r.hosting_id,
         target: r.target,
@@ -43570,6 +44212,8 @@ mod tests {
             no_offsite,
             local_note: String::new(),
             s3_ok_targets: Vec::new(),
+            purpose: String::new(),
+            held: false,
         }
     }
 
@@ -43990,6 +44634,93 @@ mod tests {
             .await
             .expect_err("no target → must refuse");
         assert!(matches!(err, RpcError::Validation { .. }), "got: {err:?}");
+    }
+
+    /// Pre-update backups live by their own rule: a clean one goes after
+    /// `pre_update_keep_days`, a held one never by age, and none of them is
+    /// one of the site's newest N — so a nightly update batch cannot push a
+    /// real scheduled backup past the floor.
+    #[tokio::test]
+    async fn prune_gives_pre_update_backups_their_own_retention() {
+        use hyperion_state::backups;
+        let pool = open_memory().await.expect("open");
+        let mut s = svc(pool.clone(), happy_mocks());
+        let dir = tempfile::tempdir().expect("dir");
+        let cfg = dir.path().join("agent.toml");
+        std::fs::write(
+            &cfg,
+            "[backup_retention]\nmax_age_days = 30\nkeep_latest_n = 2\npre_update_keep_days = 14\n",
+        )
+        .expect("cfg");
+        s.agent_config_path = Some(cfg);
+        s.create(req("pre.cz")).await.expect("create");
+        let detail = s
+            .get(HostingSelector::Domain(Domain::parse("pre.cz").unwrap()))
+            .await
+            .expect("get");
+        let day = 86_400;
+        let now = now_secs();
+        let mk = |age_days: i64, purpose: &'static str, held: bool| {
+            let pool = pool.clone();
+            let id = detail.id.clone();
+            async move {
+                let at = now - age_days * day;
+                let r = backups::start(&pool, &id, "local", at)
+                    .await
+                    .expect("start");
+                backups::mark_ok(
+                    &pool,
+                    r,
+                    &format!("/nonexistent/pre.cz-{at}.tar.gz"),
+                    None,
+                    1,
+                    at + 1,
+                )
+                .await
+                .expect("ok");
+                if !purpose.is_empty() {
+                    backups::set_purpose(&pool, r, purpose, held)
+                        .await
+                        .expect("purpose");
+                }
+                r
+            }
+        };
+        let pu = backups::PURPOSE_PRE_UPDATE;
+        let fresh_clean = mk(1, pu, false).await;
+        let old_held = mk(100, pu, true).await;
+        let old_clean = mk(20, pu, false).await;
+        let ord_a = mk(40, "", false).await;
+        let ord_b = mk(41, "", false).await;
+        let ord_c = mk(42, "", false).await;
+
+        let pruned = s.prune_old_backups(&detail.id).await.expect("prune");
+        let left: std::collections::HashSet<i64> = backups::list_for(&pool, &detail.id, 100)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(pruned, 2, "left: {left:?}");
+        assert!(left.contains(&fresh_clean), "clean, within 14 days");
+        assert!(left.contains(&old_held), "held: never by age");
+        assert!(!left.contains(&old_clean), "clean, past 14 days");
+        assert!(
+            left.contains(&ord_a) && left.contains(&ord_b),
+            "the newest 2 ORDINARY backups"
+        );
+        assert!(!left.contains(&ord_c), "third ordinary, past 30 days");
+
+        // Read back what the sweep writes, through the same row the list sees.
+        backups::set_held(&pool, old_held, false)
+            .await
+            .expect("release");
+        let row = backups::get_by_id(&pool, old_held)
+            .await
+            .expect("get")
+            .expect("row");
+        assert!(row.is_pre_update() && !row.held);
+        assert_eq!(s.prune_old_backups(&detail.id).await.expect("prune 2"), 1);
     }
 
     /// The Backups card's reason comes from the OWNING node's policy: with the
@@ -44770,6 +45501,150 @@ mod tests {
         .await
         .expect("opt out");
         assert!(s.waf_ingest(logs.path(), since, now).await.is_empty());
+    }
+
+    fn engine(available: bool) -> hyperion_types::crs::ModsecStatus {
+        hyperion_types::crs::ModsecStatus {
+            module: available,
+            crs: available,
+            crs_version: "3.3.4".into(),
+            ..Default::default()
+        }
+    }
+
+    /// Turning CRS on needs the engine on the node; with it, the rule set is
+    /// loaded at http level BEFORE the vhost, and unloaded again when the
+    /// last site turns it off. Bad exclusions are refused by name; a caller
+    /// that predates the tier keeps the stored settings.
+    #[tokio::test]
+    async fn crs_settings_validate_toggle_the_rule_set_and_survive_old_callers() {
+        let pool = open_memory().await.expect("open");
+        let mut a = happy_mocks();
+        a.expect_nginx_delete_htpasswd().returning(|_| Ok(()));
+        let available = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let loaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (av, ld) = (available.clone(), loaded.clone());
+        a.expect_modsec_status()
+            .returning(move || hyperion_types::crs::ModsecStatus {
+                loaded: ld.load(std::sync::atomic::Ordering::SeqCst),
+                ..engine(av.load(std::sync::atomic::Ordering::SeqCst))
+            });
+        let syncs = std::sync::Arc::new(std::sync::Mutex::new(Vec::<bool>::new()));
+        let (sy, ld) = (syncs.clone(), loaded.clone());
+        a.expect_modsec_sync_http().returning(move |need| {
+            sy.lock().expect("lock").push(need);
+            ld.store(need, std::sync::atomic::Ordering::SeqCst);
+            Ok(true)
+        });
+        let s = svc(pool.clone(), a);
+        s.create(req("example.cz")).await.expect("create");
+        let sel = HostingSelector::Domain(Domain::parse("example.cz").expect("parse"));
+
+        let mut on = vh_defaults();
+        on.crs_mode = "block".into();
+        let err = s.set_vhost_options(sel.clone(), on.clone(), None).await;
+        assert!(format!("{}", err.expect_err("no engine")).contains("install"));
+        assert!(syncs.lock().expect("lock").is_empty());
+
+        available.store(true, std::sync::atomic::Ordering::SeqCst);
+        on.crs_paranoia = 2;
+        on.crs_exclusions = r#"[{"rules":[942100],"path":"/x"}]"#.into();
+        s.set_vhost_options(sel.clone(), on.clone(), None)
+            .await
+            .expect("on");
+        assert_eq!(*syncs.lock().expect("lock"), vec![true], "rule set loaded");
+        let got = s.get(sel.clone()).await.expect("get").vhost_options;
+        assert_eq!(got.crs_mode, "block");
+        assert_eq!(got.crs_paranoia, 2);
+        assert_eq!(got.crs_threshold, 5, "default filled in");
+        assert_eq!(got.crs_exclusions, r#"[{"rules":[942100],"path":"/x"}]"#);
+        assert_eq!(s.modsec_status().await.expect("st").active_sites, 1);
+
+        // An older master knows nothing of CRS: everything stays.
+        s.set_vhost_options(sel.clone(), vh_defaults(), None)
+            .await
+            .expect("legacy");
+        let got = s.get(sel.clone()).await.expect("get").vhost_options;
+        assert_eq!(got.crs_mode, "block");
+        assert_eq!(got.crs_exclusions, r#"[{"rules":[942100],"path":"/x"}]"#);
+        assert_eq!(syncs.lock().expect("lock").len(), 1, "no toggle, no sync");
+
+        // Re-rendered while the rule set was unloaded (a resume after the
+        // boot sync dropped it): it is loaded again before the vhost.
+        loaded.store(false, std::sync::atomic::Ordering::SeqCst);
+        s.set_vhost_options(sel.clone(), vh_defaults(), None)
+            .await
+            .expect("re-render");
+        assert_eq!(*syncs.lock().expect("lock"), vec![true, true]);
+
+        let mut bad = on.clone();
+        bad.crs_exclusions = r#"[{"rules":[949110]}]"#.into();
+        let err = s.set_vhost_options(sel.clone(), bad, None).await;
+        assert!(format!("{}", err.expect_err("structural")).contains("949110"));
+        let mut bad = on.clone();
+        bad.crs_paranoia = 4;
+        assert!(s.set_vhost_options(sel.clone(), bad, None).await.is_err());
+
+        let mut off = on.clone();
+        off.crs_mode = "off".into();
+        s.set_vhost_options(sel.clone(), off, None)
+            .await
+            .expect("off");
+        assert_eq!(
+            *syncs.lock().expect("lock"),
+            vec![true, true, false],
+            "rule set unloaded"
+        );
+        assert_eq!(s.modsec_status().await.expect("st").active_sites, 0);
+    }
+
+    /// The node-wide audit log is attributed by transaction id: entries for
+    /// this node's site are recorded under CRS tags, entries for an id it
+    /// does not host are dropped, and nothing is offered for a ban.
+    #[tokio::test]
+    async fn crs_ingest_attributes_audit_entries_to_local_sites_only() {
+        let pool = open_memory().await.expect("open");
+        let s = svc(pool.clone(), happy_mocks());
+        s.create(req("example.cz")).await.expect("create");
+        let a = s
+            .get(HostingSelector::Domain(
+                Domain::parse("example.cz").expect("parse"),
+            ))
+            .await
+            .expect("get");
+        let fixture = include_str!("../../hyperion-adapters/testdata/modsec_audit.jsonl")
+            .replace("01a110d5-1ee1-71c2-b98b-0e31aa826f3b", a.id.as_str());
+        let dir = tempfile::tempdir().expect("dir");
+        let log = dir.path().join("audit.log");
+        std::fs::write(&log, &fixture).expect("write");
+        let now = now_secs();
+        s.crs_ingest(&log, now).await;
+
+        let act = s.waf_activity(a.id.as_str()).await.expect("activity");
+        let tags: Vec<&str> = act.recent.iter().map(|h| h.rule.as_str()).collect();
+        assert_eq!(
+            tags,
+            vec!["crs_body", "crs_xss", "crs_sqli"],
+            "newest first, this site only"
+        );
+        assert_eq!(act.recent[2].detail, "942100 · score 5");
+        assert!(
+            hyperion_state::waf::ip_offenders(&pool, a.id.as_str(), 0, 1)
+                .await
+                .expect("offenders")
+                .is_empty()
+        );
+
+        // Read once: a second pass over the same log records nothing new.
+        s.crs_ingest(&log, now).await;
+        assert_eq!(
+            s.waf_activity(a.id.as_str())
+                .await
+                .expect("activity")
+                .recent
+                .len(),
+            3
+        );
     }
 
     /// Purging a site removes its WAF log and the rotated copies logrotate
@@ -53006,7 +53881,9 @@ mod tests {
             .await
             .expect("drift");
         s.package_set_monitoring(&live, false).await.expect("drift");
-        s.package_set_hardening(&live, false).await.expect("drift");
+        s.package_set_waf_level(&live, hyperion_types::waf::WafLevel::Off)
+            .await
+            .expect("drift");
 
         assert_eq!(
             s.package_enforce_tick().await.expect("tick"),
@@ -53032,6 +53909,164 @@ mod tests {
         );
         // …and the pass right after a correction is quiet again.
         assert_eq!(s.package_enforce_tick().await.expect("tick"), 0);
+    }
+
+    /// The firewall a plan sells: held at Strict, the Core Rule Set and the
+    /// brute-force scan forced, the operator told when the node lacks what
+    /// the plan needs (once, not every tick), and a cancel putting back the
+    /// EXACT prior level — Standard, not merely "still on".
+    #[tokio::test]
+    async fn firewall_package_enforces_warns_once_and_restores_exactly() {
+        use hyperion_types::crs::CrsMode;
+        use hyperion_types::waf::WafLevel;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let pool = open_memory().await.expect("open");
+        let mut mocks = package_mocks();
+        // No ModSecurity engine on this node — until the test installs one.
+        let engine = std::sync::Arc::new(AtomicBool::new(false));
+        let e = engine.clone();
+        mocks.expect_modsec_status().returning(move || {
+            let on = e.load(Ordering::SeqCst);
+            hyperion_types::crs::ModsecStatus {
+                module: on,
+                crs: on,
+                ..Default::default()
+            }
+        });
+        mocks.expect_modsec_sync_http().returning(|_| Ok(true));
+        let s = svc(pool.clone(), mocks);
+        let detail = hosting_for_packages(&s, "fw.cz").await;
+        let hid = detail.id.as_str().to_string();
+        let sel = HostingSelector::Id(detail.id.clone());
+        // The customer's own setup: WAF on Standard, scan opted out.
+        s.package_set_waf_level(&detail, WafLevel::Standard)
+            .await
+            .expect("seed waf");
+        s.hosting_kv_set(hid.clone(), FAIL2BAN_HTTP_KV_KEY.into(), "off".into())
+            .await
+            .expect("seed scan");
+
+        let mut f = PackageFeatures {
+            crs: CrsPin::Detect,
+            bruteforce: FeatureToggle::On,
+            ..Default::default()
+        };
+        f.set_firewall_choice("strict");
+        let def = s
+            .package_create(care_input("Bezpečnost", f))
+            .await
+            .expect("define");
+        let act = s
+            .package_activate(sel.clone(), def.id, None, None)
+            .await
+            .expect("activate");
+        let opts = s.get(sel.clone()).await.expect("get").vhost_options;
+        assert_eq!(opts.effective_waf_level(), WafLevel::Strict);
+        assert_eq!(
+            opts.crs_settings().mode,
+            CrsMode::Off,
+            "no engine: the Core Rule Set waits instead of failing the activation"
+        );
+        assert_eq!(
+            kv_of(&pool, &hid, FAIL2BAN_HTTP_KV_KEY).await.as_deref(),
+            Some("on")
+        );
+        let prior: PackagePriorState =
+            serde_json::from_str(&act.prior_state_json.expect("captured")).expect("de");
+        assert_eq!(prior.waf_level.as_deref(), Some("standard"));
+        assert_eq!(prior.crs.as_deref(), Some("off"));
+        assert_eq!(prior.bruteforce, Some(false));
+
+        // Read back what the definition and the activation stored (mig 084).
+        let back = s.package_get(def.id).await.expect("get def");
+        assert_eq!(back.features.firewall_choice(), "strict");
+        assert_eq!(back.features.crs, CrsPin::Detect);
+        assert_eq!(back.features.bruteforce, FeatureToggle::On);
+        let row = hyperion_state::packages::get_activation(&pool, act.id)
+            .await
+            .expect("read")
+            .expect("row");
+        assert!(row.features.firewall_strict);
+        assert_eq!(row.features.crs, CrsPin::Detect);
+
+        // The node has no ModSecurity: the operator is told, and told once.
+        assert_eq!(s.package_enforce_tick().await.expect("tick"), 0);
+        let warned = kv_of(&pool, &hid, PACKAGE_PROTECTION_WARNED_KV)
+            .await
+            .unwrap_or_default();
+        assert!(warned.contains("ModSecurity"), "{warned}");
+        assert!(
+            !warned.contains("brute-force"),
+            "a plan that only just started gets the scanner's first pass: {warned}"
+        );
+        s.package_enforce_tick().await.expect("tick 2");
+        assert_eq!(
+            kv_of(&pool, &hid, PACKAGE_PROTECTION_WARNED_KV)
+                .await
+                .unwrap_or_default(),
+            warned,
+            "same reason, no new alert"
+        );
+
+        // Engine installed: the next tick switches the rule set on and the
+        // outstanding alert clears.
+        engine.store(true, Ordering::SeqCst);
+        assert_eq!(s.package_enforce_tick().await.expect("tick 3"), 1);
+        assert_eq!(
+            s.get(sel.clone())
+                .await
+                .expect("get")
+                .vhost_options
+                .crs_settings()
+                .mode,
+            CrsMode::Detect
+        );
+        assert_eq!(
+            kv_of(&pool, &hid, PACKAGE_PROTECTION_WARNED_KV)
+                .await
+                .unwrap_or_default(),
+            ""
+        );
+
+        // A hand-lowered level comes back to Strict.
+        let live = s.get(sel.clone()).await.expect("re-read");
+        s.package_set_waf_level(&live, WafLevel::Standard)
+            .await
+            .expect("drift");
+        assert_eq!(s.package_enforce_tick().await.expect("tick 4"), 1);
+
+        // Cancel: exactly what the site had before.
+        s.package_cancel(sel.clone(), act.id).await.expect("cancel");
+        let opts = s.get(sel.clone()).await.expect("get").vhost_options;
+        assert_eq!(opts.effective_waf_level(), WafLevel::Standard);
+        assert_eq!(opts.crs_settings().mode, CrsMode::Off);
+        assert_eq!(
+            kv_of(&pool, &hid, FAIL2BAN_HTTP_KV_KEY).await.as_deref(),
+            Some("off")
+        );
+    }
+
+    #[test]
+    fn package_waf_target_keeps_a_stricter_hand_set_level() {
+        use hyperion_types::waf::WafLevel::*;
+        assert_eq!(package_waf_target(None, Strict), None);
+        assert_eq!(package_waf_target(Some(Standard), Strict), Some(Strict));
+        assert_eq!(package_waf_target(Some(Standard), Off), Some(Standard));
+        assert_eq!(package_waf_target(Some(Strict), Standard), Some(Strict));
+        assert_eq!(package_waf_target(Some(Off), Strict), Some(Off));
+    }
+
+    #[test]
+    fn bruteforce_evidence_needs_a_recent_scan_after_the_grace() {
+        let now = 1_000_000;
+        let grace = 2 * FAIL2BAN_COVERAGE_GAP_SECS;
+        // A plan that just started: never missing yet.
+        assert!(!bruteforce_evidence_missing(None, now - 60, now));
+        // Started long ago, never scanned / scanned long ago: missing.
+        assert!(bruteforce_evidence_missing(None, now - 10 * grace, now));
+        assert!(bruteforce_evidence_missing(Some(now - grace - 1), 0, now));
+        // A recent scan is evidence.
+        assert!(!bruteforce_evidence_missing(Some(now - 300), 0, now));
     }
 
     #[tokio::test]
